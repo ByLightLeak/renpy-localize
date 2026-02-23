@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "batch_size": 5,
     "context_lines": 5,   # preceding dialogue lines as translation context
     "num_ctx": 8192,       # Ollama context window tokens
+    "target_language": "Traditional Chinese (繁體中文)",
 }
 
 
@@ -156,12 +157,14 @@ def extract_tags(text: str) -> list[str]:
 
 
 _POSSESSIVE_RE = re.compile(r"(\[[^\]]+\])'s\b")
+_CHINESE_LANG_RE = re.compile(r'chinese|中文', re.IGNORECASE)
 
 
-def preprocess_for_translation(text: str) -> str:
+def preprocess_for_translation(text: str, target_language: str = "") -> str:
     """Pre-process text before sending to LLM."""
-    # [tag]'s → [tag]的 (English possessive → Chinese possessive)
-    text = _POSSESSIVE_RE.sub(r"\1的", text)
+    # [tag]'s → [tag]的 (English possessive → Chinese possessive, Chinese targets only)
+    if _CHINESE_LANG_RE.search(target_language):
+        text = _POSSESSIVE_RE.sub(r"\1的", text)
     return text
 
 
@@ -292,23 +295,28 @@ class TranslationStopped(Exception):
         self.translated_count = translated_count
 
 
-SYSTEM_PROMPT = """\
-You are a professional English to Traditional Chinese (繁體中文) translator specializing in dialogue from a visual novel game.
+def make_system_prompt(target_language: str) -> str:
+    return f"""\
+You are a professional translator specializing in dialogue from a visual novel game.
+Translate English text into {target_language}.
 Use a conversational, natural tone appropriate for game dialogue.
 
 Rules:
-1. Translate the English text into natural, fluent Traditional Chinese.
+1. Translate the English text into natural, fluent {target_language}.
 2. Keep any <#N> placeholders (e.g. <#1>, <#2>) exactly where they are. Do NOT translate, remove, or reorder them.
 3. Do NOT add line breaks.
 4. Output ONLY the translated text, nothing else. No quotes, no explanations.
 5. You may receive preceding dialogue lines for context — use them to maintain consistency but do NOT translate them."""
 
-BATCH_SYSTEM_PROMPT = """\
-You are a professional English to Traditional Chinese (繁體中文) translator specializing in dialogue from a visual novel game.
+
+def make_batch_system_prompt(target_language: str) -> str:
+    return f"""\
+You are a professional translator specializing in dialogue from a visual novel game.
+Translate English text into {target_language}.
 Use a conversational, natural tone appropriate for game dialogue.
 
 Rules:
-1. Translate each English line into natural, fluent Traditional Chinese.
+1. Translate each English line into natural, fluent {target_language}.
 2. Keep any <#N> placeholders (e.g. <#1>, <#2>) exactly where they are. Do NOT translate, remove, or reorder them.
 3. Do NOT add line breaks.
 4. You will receive lines numbered like 1|text. Output translations in the same numbered format.
@@ -316,7 +324,7 @@ Rules:
 6. You may receive preceding dialogue lines for context — use them to maintain consistency but do NOT translate them."""
 
 
-def call_ollama(prompt: str, model: str, system: str = SYSTEM_PROMPT,
+def call_ollama(prompt: str, model: str, system: str = "",
                  base_url: str = "http://localhost:11434",
                  num_ctx: int = 8192) -> str:
     """Call Ollama generate API and return the response text."""
@@ -355,7 +363,9 @@ def call_ollama(prompt: str, model: str, system: str = SYSTEM_PROMPT,
 def translate_batch(entries: list[dict], model: str,
                     base_url: str = "http://localhost:11434",
                     context: list[tuple[str, str]] | None = None,
-                    num_ctx: int = 8192) -> tuple[list[str], list[tuple[str, str]]]:
+                    num_ctx: int = 8192,
+                    target_language: str = "Traditional Chinese (繁體中文)",
+                    ) -> tuple[list[str], list[tuple[str, str]]]:
     """Translate a batch of entries using numbered format.
 
     Tags are masked before sending to the LLM and restored afterwards.
@@ -364,6 +374,9 @@ def translate_batch(entries: list[dict], model: str,
       - translations: assembled translated strings in the same order as entries
       - ctx_pairs: (masked_input, cleaned_llm_output) for each entry, for use as future context
     """
+    system_prompt = make_system_prompt(target_language)
+    batch_system_prompt = make_batch_system_prompt(target_language)
+
     # Strip boundary tags, then mask remaining inner tags
     masked_texts: list[str] = []
     tag_maps: list[list[str]] = []
@@ -371,7 +384,7 @@ def translate_batch(entries: list[dict], model: str,
     ws_maps: list[tuple[str, str]] = []  # (leading_ws, trailing_ws)
     for entry in entries:
         prefix, core, suffix = strip_boundary_tags(entry["original"])
-        core = preprocess_for_translation(core)
+        core = preprocess_for_translation(core, target_language)
         masked, tags = mask_tags(core)
         # Preserve leading/trailing whitespace from core
         lstripped = masked.lstrip()
@@ -393,8 +406,8 @@ def translate_batch(entries: list[dict], model: str,
 
     if len(entries) == 1:
         # Single entry: use simple prompt
-        prompt = context_block + f"/no_think\nTranslate to Traditional Chinese:\n{masked_texts[0]}"
-        result = call_ollama(prompt, model, base_url=base_url, num_ctx=num_ctx)
+        prompt = context_block + f"/no_think\nTranslate to {target_language}:\n{masked_texts[0]}"
+        result = call_ollama(prompt, model, system=system_prompt, base_url=base_url, num_ctx=num_ctx)
         cleaned = clean_translation(result)
         prefix, suffix = boundary_maps[0]
         leading_ws, trailing_ws = ws_maps[0]
@@ -405,9 +418,9 @@ def translate_batch(entries: list[dict], model: str,
     lines = []
     for i, masked in enumerate(masked_texts, 1):
         lines.append(f"{i}|{masked}")
-    prompt = context_block + "/no_think\nTranslate each line to Traditional Chinese:\n" + "\n".join(lines)
+    prompt = context_block + f"/no_think\nTranslate each line to {target_language}:\n" + "\n".join(lines)
 
-    result = call_ollama(prompt, model, system=BATCH_SYSTEM_PROMPT, base_url=base_url, num_ctx=num_ctx)
+    result = call_ollama(prompt, model, system=batch_system_prompt, base_url=base_url, num_ctx=num_ctx)
 
     # Parse numbered results
     translations = {}
@@ -434,8 +447,8 @@ def translate_batch(entries: list[dict], model: str,
             ctx_pairs.append((masked_texts[i - 1], translations[i]))
         else:
             # Fallback: translate individually (masked)
-            prompt = context_block + f"Translate to Traditional Chinese:\n{masked_texts[i - 1]}"
-            text = call_ollama(prompt, model, base_url=base_url, num_ctx=num_ctx)
+            prompt = context_block + f"Translate to {target_language}:\n{masked_texts[i - 1]}"
+            text = call_ollama(prompt, model, system=system_prompt, base_url=base_url, num_ctx=num_ctx)
             cleaned = clean_translation(text)
             translated = prefix + leading_ws + unmask_tags(cleaned, tag_maps[i - 1]) + trailing_ws + suffix
             results.append(translated)
@@ -490,6 +503,7 @@ def process_file(
     force: bool = False,
     context_lines: int = 5,
     num_ctx: int = 8192,
+    target_language: str = "Traditional Chinese (繁體中文)",
 ) -> int:
     """Process a single .rpy translation file.
 
@@ -547,7 +561,10 @@ def process_file(
             start_time = time.time()
 
             ctx = recent_translations[-context_lines:] if context_lines > 0 else None
-            translations, ctx_pairs = translate_batch(batch, model, base_url=base_url, context=ctx, num_ctx=num_ctx)
+            translations, ctx_pairs = translate_batch(
+                batch, model, base_url=base_url, context=ctx, num_ctx=num_ctx,
+                target_language=target_language,
+            )
             elapsed = time.time() - start_time
 
             for j, (entry, translated) in enumerate(zip(batch, translations)):
@@ -569,12 +586,14 @@ def process_file(
                     print(f"    Translated: {translated}")
                     # Retry once individually with masked text
                     prefix, core, suffix = strip_boundary_tags(original)
-                    core = preprocess_for_translation(core)
+                    core = preprocess_for_translation(core, target_language)
                     masked, tags = mask_tags(core)
                     core_leading = masked[:len(masked) - len(masked.lstrip())]
                     core_trailing = masked[len(masked.rstrip()):]
-                    retry_prompt = f"Translate to Traditional Chinese:\n{masked.strip()}"
-                    retry_raw = call_ollama(retry_prompt, model, base_url=base_url, num_ctx=num_ctx)
+                    retry_prompt = f"Translate to {target_language}:\n{masked.strip()}"
+                    retry_raw = call_ollama(retry_prompt, model,
+                                           system=make_system_prompt(target_language),
+                                           base_url=base_url, num_ctx=num_ctx)
                     retry_cleaned = clean_translation(retry_raw)
                     translated = prefix + core_leading + unmask_tags(retry_cleaned, tags) + core_trailing + suffix
                     valid2, msg2 = validate_tags(original, translated)
@@ -637,7 +656,7 @@ def main():
     config = load_config()
 
     parser = argparse.ArgumentParser(
-        description="Translate Ren'Py .rpy files from English to Traditional Chinese using Ollama."
+        description="Translate Ren'Py .rpy files using Ollama."
     )
     parser.add_argument(
         "paths",
@@ -678,6 +697,11 @@ def main():
         action="store_true",
         help="Recursively search directories for .rpy files.",
     )
+    parser.add_argument(
+        "--language",
+        default=config["target_language"],
+        help=f"Target language for translation (default from config: {config['target_language']!r}).",
+    )
     args = parser.parse_args()
 
     # Strip trailing slash from host URL
@@ -717,6 +741,7 @@ def main():
                 base_url=base_url, force=args.force,
                 context_lines=config["context_lines"],
                 num_ctx=config["num_ctx"],
+                target_language=args.language,
             )
             file_elapsed = time.time() - file_start
             if count > 0:

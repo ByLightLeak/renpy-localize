@@ -3,5 +3,6 @@
   "model": "qwen3:14b",
   "batch_size": 5,
   "context_lines": 5,
-  "num_ctx": 8192
+  "num_ctx": 8192,
+  "target_language": "Traditional Chinese (繁體中文)"
 }
